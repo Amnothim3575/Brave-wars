@@ -1,0 +1,645 @@
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+// ============================================================================
+// SYSTEM ARCHITECTURE: REALM & RUIN CORE ENGINE
+// COMBINED ECOSYSTEM: ECONOMY, INVENTORY, ARMY TREE, BIOMES, & SIEGE SYSTEMS
+// ============================================================================
+
+namespace RealmAndRuin
+{
+    // --- GLOBAL ENUMS FOR MINECRAFT/BANNERLORD CROSSOVER ---
+    public enum ArmorTier { Wood, Stone, Iron, Diamond, Netherite }
+    public enum ToolType { Pickaxe, Axe, Sword, Shovel }
+    public enum TroopClass { Infantry, Archer, Cavalry }
+    public enum BiomeType { VerdantValley, ScorchedWastes, FrostbiteTundra, MurkyFens, Ashlands }
+    public enum KingdomStance { Neutral, Allied, War }
+
+    // ============================================================================
+    // DATA STRUCTURES & SERIALIZABLE CLASSES
+    // ============================================================================
+
+    [System.Serializable]
+    public class CustomTool
+    {
+        public string toolName;
+        public ToolType type;
+        public ArmorTier materialTier;
+        public int currentDurability;
+        public int maxDurability;
+        public float efficiencyMultiplier;
+        public int combatDamage;
+
+        public CustomTool(string name, ToolType t, ArmorTier tier)
+        {
+            toolName = name;
+            type = t;
+            materialTier = tier;
+            
+            // Scaled durability like Minecraft
+            switch (tier)
+            {
+                case ArmorTier.Wood: maxDurability = 60; efficiencyMultiplier = 1.0f; combatDamage = 2; break;
+                case ArmorTier.Stone: maxDurability = 132; efficiencyMultiplier = 1.5f; combatDamage = 4; break;
+                case ArmorTier.Iron: maxDurability = 250; efficiencyMultiplier = 2.5f; combatDamage = 6; break;
+                case ArmorTier.Diamond: maxDurability = 1561; efficiencyMultiplier = 4.0f; combatDamage = 9; break;
+                case ArmorTier.Netherite: maxDurability = 2031; efficiencyMultiplier = 5.0f; combatDamage = 12; break;
+            }
+            currentDurability = maxDurability;
+        }
+
+        public bool UseTool(int drainAmount)
+        {
+            currentDurability -= drainAmount;
+            if (currentDurability <= 0)
+            {
+                currentDurability = 0;
+                Debug.LogWarning($"{toolName} shattered due to critical wear!");
+                return true; // Broke
+            }
+            return false; // Still intact
+        }
+    }
+
+    [System.Serializable]
+    public class KingdomData
+    {
+        public int id;
+        public string kingdomName;
+        public BiomeType homeBiome;
+        public int garrisonSize;
+        public int fortificationLevel;
+        public int economicWealth;
+        public KingdomStance diplomaticStance;
+        public bool isConquered;
+
+        public KingdomData(int id, string name, BiomeType biome, int garrison, int fort, int wealth)
+        {
+            this.id = id;
+            this.kingdomName = name;
+            this.homeBiome = biome;
+            this.garrisonSize = garrison;
+            this.fortificationLevel = fort;
+            this.economicWealth = wealth;
+            this.diplomaticStance = KingdomStance.War; // Standard survival mode targets
+            this.isConquered = false;
+        }
+    }
+
+    [System.Serializable]
+    public class Troop
+    {
+        public string troopName;
+        public int tier;
+        public TroopClass troopClass;
+        public int currentHealth;
+        public int maxHealth;
+        public int baseDamage;
+        public int armorRating;
+        public int weeklyWage;
+        public int upgradeCost;
+
+        public Troop(string name, int t, TroopClass tc)
+        {
+            troopName = name;
+            tier = t;
+            troopClass = tc;
+            
+            // Balance calculations based on scaling factors
+            maxHealth = 50 + (t * 35);
+            currentHealth = maxHealth;
+            baseDamage = 8 + (t * 6);
+            armorRating = t * 4;
+            weeklyWage = 5 + (t * 8);
+            upgradeCost = 25 * (int)Mathf.Pow(2, t);
+        }
+    }
+
+    // ============================================================================
+    // MAIN MONOBEHAVIOUR INTEGRATION: KINGDOM CORE
+    // ============================================================================
+    public class KingdomCore : MonoBehaviour
+    {
+        public static KingdomCore Instance;
+
+        [Header("System Bridges")]
+        public OverworldMovement movementSystem;
+
+        [Header("Player Metadata & Currency")]
+        public string sovereignName = "Sire";
+        public int currentCrowns = 1500; // Custom Currency ($)
+        public int playerMaxHealth = 100;
+        public int playerCurrentHealth = 100;
+        public ArmorTier equippedArmor = ArmorTier.Wood;
+
+        [Header("Minecraft-Style Material Inventory")]
+        public int rawWood = 0;
+        public int rawStone = 0;
+        public int rawIron = 0;
+        public int rawDiamond = 0;
+        public int rawNetheriteScrap = 0;
+
+        [Header("Active Inventory Slots")]
+        public List<CustomTool> toolInventory = new List<CustomTool>();
+        public int activeToolIndex = 0;
+
+        [Header("Army Roster")]
+        public List<Troop> standingArmy = new List<Troop>();
+        public int maxArmyCapacity = 50;
+
+        [Header("The World Atlas (32 Kingdoms)")]
+        public List<KingdomData> continentKingdoms = new List<KingdomData>();
+        public BiomeType currentActiveBiome = BiomeType.VerdantValley;
+        public float biomeHazardTimer = 0.0f;
+
+        [Header("Siege & Defense Phase Metadata")]
+        public bool isUnderSiege = false;
+        public float waveTimer = 0f;
+        public int currentWaveNumber = 0;
+        public int defenseFortificationHealth = 1000;
+
+        private void Awake()
+        {
+            if (Instance == null) Instance = this;
+            else Destroy(gameObject);
+
+            InitializeWorldAtlas();
+        }
+
+        private void Start()
+        {
+            // Give player their starting tool loadout
+            toolInventory.Add(new CustomTool("Starter Wooden Axe", ToolType.Axe, ArmorTier.Wood));
+            toolInventory.Add(new CustomTool("Starter Wooden Pickaxe", ToolType.Pickaxe, ArmorTier.Wood));
+            
+            Debug.Log($"[Engine initialized] 32 rival kingdoms constructed. Standing by, {sovereignName}.");
+        }
+
+        private void Update()
+        {
+            HandleBiomeEnvironmentalHazards();
+            HandleSiegeWaveTimers();
+        }
+
+        // ============================================================================
+        // MAP INITIALIZATION (Generates the 32 Kingdoms across Bannerlord Biomes)
+        // ============================================================================
+        private void InitializeWorldAtlas()
+        {
+            // Generation algorithm distributing kingdoms contextually across biomes
+            string[] prefixList = { "Vlandia", "Sturgia", "Khuzait", "Battania", "Aserai", "Empire", "Garios", "Lucon" };
+            
+            int idCounter = 1;
+
+            // 1. Verdant Valley (10 Kingdoms)
+            for (int i = 1; i <= 10; i++)
+            {
+                continentKingdoms.Add(new KingdomData(idCounter++, $"{prefixList[UnityEngine.Random.Range(0, 4)]} Vale {i}", BiomeType.VerdantValley, 60, 1, 300));
+            }
+
+            // 2. Scorched Wastes (6 Kingdoms)
+            for (int i = 1; i <= 6; i++)
+            {
+                continentKingdoms.Add(new KingdomData(idCounter++, $"{prefixList[4]} Outpost {i}", BiomeType.ScorchedWastes, 100, 2, 500));
+            }
+
+            // 3. Frostbite Tundra (6 Kingdoms)
+            for (int i = 1; i <= 6; i++)
+            {
+                continentKingdoms.Add(new KingdomData(idCounter++, $"{prefixList[1]} Peak {i}", BiomeType.FrostbiteTundra, 120, 2, 450));
+            }
+
+            // 4. Murky Fens (6 Kingdoms)
+            for (int i = 1; i <= 6; i++)
+            {
+                continentKingdoms.Add(new KingdomData(idCounter++, $"{prefixList[3]} Marsh {i}", BiomeType.MurkyFens, 140, 3, 600));
+            }
+
+            // 5. Ashlands (4 Kingdoms - End Game)
+            for (int i = 1; i <= 4; i++)
+            {
+                continentKingdoms.Add(new KingdomData(idCounter++, $"Obsidian Keep {i}", BiomeType.Ashlands, 250, 5, 1200));
+            }
+        }
+
+        // ============================================================================
+        // ECONOMY & REVENUE MANAGEMENT SYSTEMS
+        // ============================================================================
+        public void AddCrowns(int amount)
+        {
+            currentCrowns += amount;
+            Debug.Log($"[ECONOMY] +{amount} Crowns. Total Purse: {currentCrowns} $");
+        }
+
+        public bool DeductCrowns(int amount)
+        {
+            if (currentCrowns >= amount)
+            {
+                currentCrowns -= amount;
+                Debug.Log($"[ECONOMY] -{amount} Crowns. Remaining Balance: {currentCrowns} $");
+                return true;
+            }
+            Debug.LogError($"[ECONOMY] Transaction rejected. Insufficient crowns! Required: {amount}, Available: {currentCrowns}");
+            return false;
+        }
+
+        public void ProcessWeeklyTaxAndWages()
+        {
+            int totalTaxesGathered = 0;
+            int totalMilitaryWages = 0;
+
+            // Gather taxes from conquered regions
+            foreach (var kingdom in continentKingdoms)
+            {
+                if (kingdom.isConquered)
+                {
+                    totalTaxesGathered += (kingdom.economicWealth / 10);
+                }
+            }
+
+            // Sum troop wages
+            foreach (var soldier in standingArmy)
+            {
+                totalMilitaryWages += soldier.weeklyWage;
+            }
+
+            AddCrowns(totalTaxesGathered);
+            
+            if (!DeductCrowns(totalMilitaryWages))
+            {
+                Debug.LogWarning("[MUTINY] You could not pay your soldiers! Top half of your roster has deserted!");
+                int desertionCount = standingArmy.Count / 2;
+                if (desertionCount > 0)
+                {
+                    standingArmy.RemoveRange(0, desertionCount);
+                }
+            }
+            else
+            {
+                Debug.Log($"[FINANCES] Weekly report complete. Taxes: +{totalTaxesGathered}. Roster Wages: -{totalMilitaryWages}");
+            }
+        }
+
+        // ============================================================================
+        // MINECRAFT INVENTORY & CRAFTING SYSTEMS
+        // ============================================================================
+        public void MineResourceNode(string nodeMaterialType)
+        {
+            if (toolInventory.Count == 0)
+            {
+                Debug.LogWarning("You cannot harvest without tools!");
+                return;
+            }
+
+            CustomTool currentTool = toolInventory[activeToolIndex];
+            
+            // Check tool damage application
+            bool broke = currentTool.UseTool(1);
+            if (broke)
+            {
+                toolInventory.RemoveAt(activeToolIndex);
+                activeToolIndex = 0;
+                return;
+            }
+
+            int amountHarvested = Mathf.RoundToInt(1 * currentTool.efficiencyMultiplier);
+
+            switch (nodeMaterialType.ToLower())
+            {
+                case "wood":
+                    rawWood += amountHarvested;
+                    break;
+                case "stone":
+                    if (currentTool.materialTier >= ArmorTier.Wood) rawStone += amountHarvested;
+                    break;
+                case "iron":
+                    if (currentTool.materialTier >= ArmorTier.Stone) rawIron += amountHarvested;
+                    break;
+                case "diamond":
+                    if (currentTool.materialTier >= ArmorTier.Iron) rawDiamond += amountHarvested;
+                    break;
+                case "netherite":
+                    if (currentTool.materialTier >= ArmorTier.Diamond) rawNetheriteScrap += amountHarvested;
+                    break;
+            }
+            Debug.Log($"[MINING] Gathered {amountHarvested} {nodeMaterialType}. Tool Durability: {currentTool.currentDurability}/{currentTool.maxDurability}");
+        }
+
+        public void CraftUpgradeTool(ToolType typeToCraft, ArmorTier targetTier)
+        {
+            // Recipe calculation check
+            int woodRequired = 2;
+            int coreMaterialRequired = 3;
+
+            switch (targetTier)
+            {
+                case ArmorTier.Stone:
+                    if (rawStone >= coreMaterialRequired && rawWood >= woodRequired) { rawStone -= coreMaterialRequired; rawWood -= woodRequired; } else return;
+                    break;
+                case ArmorTier.Iron:
+                    if (rawIron >= coreMaterialRequired && rawWood >= woodRequired) { rawIron -= coreMaterialRequired; rawWood -= woodRequired; } else return;
+                    break;
+                case ArmorTier.Diamond:
+                    if (rawDiamond >= coreMaterialRequired && rawWood >= woodRequired) { rawDiamond -= coreMaterialRequired; rawWood -= woodRequired; } else return;
+                    break;
+                case ArmorTier.Netherite:
+                    // Netherite upgrade format matches modern smithing table framework (Requires base diamond tool + netherite ingot)
+                    bool hasDiamondBase = false;
+                    CustomTool baseTool = null;
+                    foreach (var tool in toolInventory)
+                    {
+                        if (tool.type == typeToCraft && tool.materialTier == ArmorTier.Diamond)
+                        {
+                            hasDiamondBase = true;
+                            baseTool = tool;
+                            break;
+                        }
+                    }
+                    if (hasDiamondBase && rawNetheriteScrap >= 1)
+                    {
+                        rawNetheriteScrap -= 1;
+                        toolInventory.Remove(baseTool);
+                    }
+                    else
+                    {
+                        Debug.LogWarning("Smithing execution failed. You need a Diamond variation template + 1 Netherite Scrap!");
+                        return;
+                    }
+                    break;
+            }
+
+            string newName = $"{targetTier} {typeToCraft}";
+            toolInventory.Add(new CustomTool(newName, typeToCraft, targetTier));
+            Debug.Log($"[SMITHY] Successfully forged: {newName}");
+        }
+
+        // ============================================================================
+        // BANNERLORD-STYLE TACTICAL ARMY INFRASTRUCTURE
+        // ============================================================================
+        public void RecruitTroopFromLocalVillage(TroopClass selectedClass)
+        {
+            int baseRecruitFee = 35;
+            if (standingArmy.Count >= maxArmyCapacity)
+            {
+                Debug.LogWarning("Roster capacity maxed! Build more keeps/castles to expand limits.");
+                return;
+            }
+
+            if (DeductCrowns(baseRecruitFee))
+            {
+                string tName = $"Basic {selectedClass}";
+                Troop freshRecruit = new Troop(tName, 1, selectedClass);
+                standingArmy.Add(freshRecruit);
+                Debug.Log($"[ARMY] Appended {tName} to active cohorts.");
+            }
+        }
+
+        public void UpgradeSoldierInRoster(int indexInRoster)
+        {
+            if (indexInRoster < 0 || indexInRoster >= standingArmy.Count) return;
+
+            Troop activeUnit = standingArmy[indexInRoster];
+
+            if (activeUnit.tier >= 5)
+            {
+                Debug.LogWarning("Soldier already achieved maximum capability tier.");
+                return;
+            }
+
+            if (DeductCrowns(activeUnit.upgradeCost))
+            {
+                activeUnit.tier++;
+                activeUnit.maxHealth += 40;
+                activeUnit.currentHealth = activeUnit.maxHealth;
+                activeUnit.baseDamage += 8;
+                activeUnit.armorRating += 5;
+                activeUnit.weeklyWage += 12;
+                
+                string alignmentPrefix = activeUnit.troopClass == TroopClass.Infantry ? "Legionary" : 
+                                         activeUnit.troopClass == TroopClass.Archer ? "Sharpshooter" : "Cataphract";
+                
+                activeUnit.troopName = $"Elite Tier {activeUnit.tier} {alignmentPrefix}";
+                activeUnit.upgradeCost *= 2;
+
+                Debug.Log($"[MILITARY PROMOTION] {activeUnit.troopName} initialized successfully.");
+            }
+        }
+
+        // ============================================================================
+        // ENVIRONMENTAL BIOME SIMULATION
+        // ============================================================================
+        private void HandleBiomeEnvironmentalHazards()
+        {
+            if (Time.timeScale == 0.0f) return; // Time suspended while stationary
+
+            biomeHazardTimer += Time.deltaTime;
+            if (biomeHazardTimer >= 10.0f) // Every 10 continuous movement seconds
+            {
+                biomeHazardTimer = 0.0f;
+                ExecuteBiomeTickLogics();
+            }
+        }
+
+        private void ExecuteBiomeTickLogics()
+        {
+            switch (currentActiveBiome)
+            {
+                case BiomeType.ScorchedWastes:
+                    // Desert dehydration simulation
+                    Debug.Log("[BIOME HAZARD] Heat exhaustion ticks. Army morale dampened.");
+                    break;
+                case BiomeType.FrostbiteTundra:
+                    // Freezing mechanic
+                    Debug.Log("[BIOME HAZARD] Hypothermia threat active. Campfires required.");
+                    playerCurrentHealth = Mathf.Max(playerCurrentHealth - 2, 10);
+                    break;
+                case BiomeType.MurkyFens:
+                    // Swamp poison system
+                    Debug.Log("[BIOME HAZARD] Toxic marsh vapors bypass armor defenses!");
+                    break;
+                case BiomeType.Ashlands:
+                    // Lava ash falls
+                    Debug.Log("[BIOME HAZARD] Volcanic debris damages shields!");
+                    break;
+            }
+        }
+
+        // ============================================================================
+        // KINGDOM CONQUEST ENGINE & RESOLUTION
+        // ============================================================================
+        public void InitiateInvasionOnKingdom(int targetKingdomId)
+        {
+            KingdomData target = continentKingdoms.Find(k => k.id == targetKingdomId);
+
+            if (target == null) return;
+            if (target.isConquered)
+            {
+                Debug.Log("This kingdom is already flying your banner!");
+                return;
+            }
+
+            // Simulate field combat math array parameters
+            int totalPlayerPower = 0;
+            foreach (var troop in standingArmy)
+            {
+                totalPlayerPower += (troop.baseDamage + (troop.currentHealth / 10));
+            }
+
+            int totalEnemyPower = target.garrisonSize * (15 + (target.fortificationLevel * 5));
+
+            Debug.Log($"[WARFARE] Invading {target.kingdomName}. Calculated Power - Player Force: {totalPlayerPower} vs Castle Defense: {totalEnemyPower}");
+
+            if (totalPlayerPower >= totalEnemyPower)
+            {
+                // Victory logic processing calculations
+                target.isConquered = true;
+                target.diplomaticStance = KingdomStance.Allied;
+                AddCrowns(target.economicWealth);
+
+                // Simulate casualty rates (50% random operational damage distribution to army rosters)
+                int casualties = standingArmy.Count / 3;
+                if (casualties > 0) standingArmy.RemoveRange(0, casualties);
+
+                Debug.Log($"[VICTORY] You conquered {target.kingdomName}! Looted {target.economicWealth} Crowns. You sustained {casualties} casualties.");
+                CheckGlobalCampaignVictoryCondition();
+            }
+            else
+            {
+                // Defeat resolution systems
+                standingArmy.Clear(); // Complete wipe out of forces
+                playerCurrentHealth = 15; // Extracted safely near dead state
+                Debug.LogError($"[DEFEAT] Your vanguard army was butchered at the walls of {target.kingdomName}!");
+            }
+        }
+
+        private void CheckGlobalCampaignVictoryCondition()
+        {
+            int totalConquered = 0;
+            foreach (var k in continentKingdoms)
+            {
+                if (k.isConquered) totalConquered++;
+            }
+
+            if (totalConquered >= totalRivalKingdoms)
+            {
+                Debug.Log("==========================================================");
+                Debug.Log("EMPIRE TRIUMPHANT: All 32 Kingdoms subdued! Long live the Emperor!");
+                Debug.Log("==========================================================");
+            }
+        }
+
+        // ============================================================================
+        // KINGDOM SIEGE DEFENSE SYSTEMS
+        // ============================================================================
+        public void TriggerManualRivalSiegeInvasion()
+        {
+            isUnderSiege = true;
+            currentWaveNumber++;
+            waveTimer = 60.0f; // 60 seconds to prepare structures before breach execution
+            Debug.LogWarning($"[SIEGE EMERGENCY] Kingdom warning! Wave {currentWaveNumber} marching on our borders!");
+        }
+
+        private void HandleSiegeWaveTimers()
+        {
+            if (!isUnderSiege) return;
+
+            waveTimer -= Time.deltaTime;
+            if (waveTimer <= 0)
+            {
+                ResolveSiegeBattleIntersection();
+            }
+        }
+
+        private void ResolveSiegeBattleIntersection()
+        {
+            int threatLevel = currentWaveNumber * 180;
+            int playerDefensivePower = 0;
+
+            foreach (var troop in standingArmy)
+            {
+                playerDefensivePower += (troop.baseDamage + troop.armorRating);
+            }
+
+            // Apply block architectural modifications
+            playerDefensivePower += (defenseFortificationHealth / 4);
+
+            if (playerDefensivePower >= threatLevel)
+            {
+                isUnderSiege = false;
+                int reward = currentWaveNumber * 300;
+                AddCrowns(reward);
+                defenseFortificationHealth = Mathf.Max(defenseFortificationHealth - 150, 200);
+                Debug.Log($"[SIEGE DEFENDED] Siege broken! Earned {reward} Crowns. Repairs needed on walls.");
+            }
+            else
+            {
+                defenseFortificationHealth -= 400;
+                if (defenseFortificationHealth <= 0)
+                {
+                    Debug.LogError("[GAME OVER] Your capital walls were pulverized. The kingdom has fallen.");
+                    Time.timeScale = 0.0f;
+                }
+                else
+                {
+                    Debug.LogWarning($"[BREACHED] Defensive cohort shattered! Fortification HP remaining: {defenseFortificationHealth}");
+                    standingArmy.Clear();
+                    isUnderSiege = false;
+                }
+            }
+        }
+    }
+
+    // ============================================================================
+    // OVERWORLD INTERACTIVE NAVIGATION CLASS
+    // ============================================================================
+    public class OverworldMovement : MonoBehaviour
+    {
+        [Header("Movement Mechanics")]
+        public float marchSpeed = 6.0f;
+        private Vector3 targetDestination;
+        private bool isMarching = false;
+
+        private void Start()
+        {
+            targetDestination = transform.position;
+        }
+
+        private void Update()
+        {
+            // Raycast execution checking for target points on the landscape layout
+            if (Input.GetMouseButtonDown(1)) // Mouse Right-Click context execution
+            {
+                Ray ray = Camera.main.ScreenPointToRay(Input.mousePosition);
+                if (Physics.Raycast(ray, out RaycastHit hit))
+                {
+                    targetDestination = new Vector3(hit.point.x, transform.position.y, hit.point.z);
+                    isMarching = true;
+                }
+            }
+
+            if (isMarching)
+            {
+                ExecuteMarchCycle();
+            }
+        }
+
+        private void ExecuteMarchCycle()
+        {
+            float step = marchSpeed * Time.deltaTime;
+            transform.position = Vector3.MoveTowards(transform.position, targetDestination, step);
+
+            // Bannerlord Concept: Time registers only while moving paths
+            Time.timeScale = 1.0f;
+
+            if (Vector3.Distance(transform.position, targetDestination) < 0.1f)
+            {
+                isMarching = false;
+                
+                // Pause operations completely while stationary
+                Time.timeScale = 0.0f;
+                Debug.Log("[MAP MOVEMENT] Target coordinates reached. World time progression suspended.");
+            }
+        }
+    }
+}
